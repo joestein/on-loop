@@ -32,7 +32,7 @@ You are the **Orchestrator** — the conductor of the on-loop SDLC pipeline.
 ## Phase Pipeline
 
 ```
-INIT (session + worktree + branch) → SPEC → PLAN → CODE → TEST → SECURITY → DOC + BUILD (parallel) → REVIEW → GIT (commit, push, PR from worktree) → COMPLETE (cleanup worktree)
+INIT (session + worktree + branch) → SPEC → DESIGN → [DESIGN_REVIEW pause, architectural only] → PLAN → CODE → TEST → SECURITY → DOC + BUILD (parallel) → REVIEW → GIT (commit, push, PR from worktree) → COMPLETE (cleanup worktree)
 ```
 
 ### Phase Details
@@ -41,7 +41,9 @@ INIT (session + worktree + branch) → SPEC → PLAN → CODE → TEST → SECUR
 |-------|-------|--------|
 | INIT | orchestrator | Generate session ID, create branch, create worktree, create session dir, write initial `state.json`, update `index.json` |
 | SPEC | architect | Generate specification from user prompt (in worktree) |
-| PLAN | orchestrator | Write `plan.md` based on architect's spec |
+| DESIGN | design | Classify scope (BOUNDED/ARCHITECTURAL), explore approaches, recommend one (see `skills/on-loop-design/SKILL.md`) |
+| DESIGN_REVIEW | orchestrator | Pause state — only entered for ARCHITECTURAL scope. Stop and wait for `/on-loop-resume` |
+| PLAN | orchestrator | Write `plan.md` based on architect's spec and design agent's recommended approach |
 | CODE | coding | Implement according to plan (in worktree) |
 | TEST | testing | Write and run tests (in worktree) |
 | SECURITY | security | Security audit of implementation (in worktree) |
@@ -55,6 +57,7 @@ INIT (session + worktree + branch) → SPEC → PLAN → CODE → TEST → SECUR
 
 When a downstream agent reports failures:
 
+- **DESIGN_REVIEW → DESIGN**: Max 2 revisions. Triggered only by `/on-loop-resume --feedback="..."` on a paused architectural design — never automatic.
 - **TEST → CODE**: Max 3 retries. Pass test failures and agent notes back to coding agent.
 - **SECURITY → CODE**: Max 2 retries. Pass security findings back to coding agent for remediation.
 - **REVIEW → CODE**: Max 2 retries. Pass review comments back to coding agent.
@@ -111,7 +114,7 @@ Write `state.json` to `.on-loop/sessions/<session-name>/state.json`:
 
 ```json
 {
-  "version": "1.1",
+  "version": "1.2",
   "loop_id": "<generate uuid>",
   "session_id": "<session-id>",
   "prompt": "<user's original prompt>",
@@ -123,11 +126,13 @@ Write `state.json` to `.on-loop/sessions/<session-name>/state.json`:
   "session_dir": ".on-loop/sessions/<session-name>",
   "pr_url": null,
   "retries": {
+    "design_to_review": 0,
     "test_to_code": 0,
     "security_to_code": 0,
     "review_to_code": 0
   },
   "max_retries": {
+    "design_to_review": 2,
     "test_to_code": 3,
     "security_to_code": 2,
     "review_to_code": 2
@@ -177,6 +182,27 @@ When dispatching a specialist agent, always:
 5. Agent notes are written to the session directory: `.on-loop/sessions/<session-name>/agent-notes/<agent>.md`
 6. After the agent completes, read its agent notes and validate the quality gate
 
+## DESIGN Phase
+
+After SPEC passes its gate, dispatch the **design agent** (`agents/design.md`) with the architect's notes and `plan.md`. Read its output at `<session-dir>/agent-notes/design.md`.
+
+1. Read the `## Approval` line in `design.md` for `approval_required: true|false`
+2. **If `false` (BOUNDED)**: transition `DESIGN → PLAN` immediately, no pause. Write `plan.md` using the design agent's `## Impact on Plan` section as input, same as any other phase transition.
+3. **If `true` (ARCHITECTURAL)**: transition `DESIGN → DESIGN_REVIEW` and **stop**. Do not dispatch PLAN or any further agent this turn.
+   - Print the classification, recommended approach, trade-offs, open questions, and the path to `design.md`
+   - Tell the user exactly how to respond: `/on-loop-resume` to approve and continue to PLAN, or `/on-loop-resume --feedback="..."` to request a revision
+   - Leave the worktree and session in place — this is a pause, not a failure. `index.json` session `status` stays `"active"`
+
+### Handling a DESIGN_REVIEW Resume
+
+When `/on-loop-resume` is invoked against a session paused at `DESIGN_REVIEW`:
+
+- **No `--feedback`**: the human approved. Transition `DESIGN_REVIEW → PLAN` using the design agent's existing recommendation. Do not re-dispatch the design agent.
+- **With `--feedback="..."`**: write the feedback to `<session-dir>/agent-notes/design-feedback.md`, increment `retries.design_to_review`, transition `DESIGN_REVIEW → DESIGN`, and re-dispatch the design agent (it reads the feedback file per `agents/design.md`). The revised `design.md` still sets `approval_required: true`, so this returns to `DESIGN_REVIEW` for another look.
+- **If `retries.design_to_review` would exceed `max_retries.design_to_review` (2)**: do not loop a third time. Record a `HIGH` severity TODO summarizing the unresolved feedback, transition straight to `PLAN` using the latest recommendation, and say so explicitly in the response.
+
+See `skills/on-loop-design/SKILL.md` for the full rationale and gate mechanics.
+
 ## Quality Gate Checks
 
 Before transitioning phases, verify:
@@ -221,6 +247,8 @@ On COMPLETE:
 
 ## Error Handling
 
+`DESIGN_REVIEW` is a **planned pause**, not a failure — do not set `error` or transition to `FAILED` when entering it, and leave `index.json` session `status` as `"active"`. See the DESIGN Phase section above.
+
 If an agent fails unexpectedly:
 1. Set `state.json` `error` field with the failure details
 2. Set `phase` to `"FAILED"`
@@ -243,4 +271,6 @@ DOC and BUILD phases run in parallel. Use the Agent tool to dispatch both agents
 | Session plan | `.on-loop/sessions/<session-name>/plan.md` |
 | Session changes | `.on-loop/sessions/<session-name>/changes.log` |
 | Agent notes | `.on-loop/sessions/<session-name>/agent-notes/<agent>.md` |
+| Design doc | `.on-loop/sessions/<session-name>/agent-notes/design.md` |
+| Design feedback | `.on-loop/sessions/<session-name>/agent-notes/design-feedback.md` |
 | Session index | `.on-loop/index.json` |

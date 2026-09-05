@@ -39,6 +39,7 @@ Agent:      <current agent>
 Progress:
   ✅ INIT
   ✅ SPEC — <brief summary>
+  ✅ DESIGN — <classification: BOUNDED/ARCHITECTURAL>
   ✅ PLAN
   ✅ CODE — <brief summary>
   🔄 TEST — In progress
@@ -48,20 +49,42 @@ Progress:
   ⬜ REVIEW
 
 Retries:
-  test→code:     1/3
-  security→code: 0/2
-  review→code:   0/2
+  design→review:  0/2
+  test→code:      1/3
+  security→code:  0/2
+  review→code:    0/2
 
 TODOs: None
 ```
 
+If phase is `"DESIGN_REVIEW"`, show it as a distinct, non-error waiting state rather than `🔄`:
+
+```
+Active Session: 20260426_100000_user-api
+══════════════════════════════
+Phase:      DESIGN_REVIEW (paused — awaiting human approval)
+
+Progress:
+  ✅ INIT
+  ✅ SPEC — <brief summary>
+  ⏸️  DESIGN — ARCHITECTURAL, awaiting approval (see design.md)
+  ⬜ PLAN
+  ...
+
+Next step: review `.on-loop/sessions/<session-name>/agent-notes/design.md`, then
+  /on-loop-resume                       # approve and continue
+  /on-loop-resume --feedback="..."      # request a revision
+```
+
 4. If agent notes exist in the session directory, show a brief summary from each completed agent:
    - Read each file in `.on-loop/sessions/<session-name>/agent-notes/`
-   - Extract and display the `## Summary` section
+   - Extract and display the `## Summary` section (for `design.md`, show the `## Classification` and `## Recommended Approach` sections instead — it has no `## Summary`)
 
 5. For **failed** sessions, also display the error field from state.json and suggest `/on-loop-resume --session=<session-name>`
 
-6. Show active worktrees:
+6. For sessions **paused at `DESIGN_REVIEW`**, treat them as active (not failed) and display the "Next step" block above instead of an error
+
+7. Show active worktrees:
    ```bash
    git worktree list
    ```

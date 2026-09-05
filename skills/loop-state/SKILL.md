@@ -11,7 +11,11 @@ This skill manages the session `state.json` lifecycle — creation, valid transi
 
 ```
 INIT → SPEC
-SPEC → PLAN
+SPEC → DESIGN
+DESIGN → PLAN          (BOUNDED, auto-approved)
+DESIGN → DESIGN_REVIEW (ARCHITECTURAL, pending approval)
+DESIGN_REVIEW → PLAN   (resume: approved)
+DESIGN_REVIEW → DESIGN (resume: revision requested, max 2)
 PLAN → CODE
 CODE → TEST
 TEST → CODE          (retry: test failures)
@@ -34,7 +38,7 @@ FAILED → ANY         (resume)
 
 ```json
 {
-  "version": "1.1",
+  "version": "1.2",
   "loop_id": "<uuid>",
   "session_id": "<uuid>",
   "prompt": "<user prompt>",
@@ -42,11 +46,13 @@ FAILED → ANY         (resume)
   "started_at": "<ISO 8601>",
   "updated_at": "<ISO 8601>",
   "retries": {
+    "design_to_review": 0,
     "test_to_code": 0,
     "security_to_code": 0,
     "review_to_code": 0
   },
   "max_retries": {
+    "design_to_review": 2,
     "test_to_code": 3,
     "security_to_code": 2,
     "review_to_code": 2
@@ -67,6 +73,10 @@ New fields in v1.1:
 - `worktree_path`: Relative path to the git worktree for this session
 - `session_dir`: Relative path to the session log directory under `.on-loop/sessions/`
 
+New in v1.2:
+- `DESIGN` and `DESIGN_REVIEW` phases (see Phase to Agent Mapping and Valid Phase Transitions above)
+- `retries.design_to_review` / `max_retries.design_to_review`: revision budget for the DESIGN_REVIEW human approval gate (see `skills/on-loop-design/SKILL.md`)
+
 ### Transition Phase
 
 When transitioning:
@@ -82,8 +92,10 @@ When transitioning:
 When a retry is triggered:
 1. Increment the appropriate retry counter
 2. Check if the counter exceeds the maximum
-3. If within limit: transition back to CODE
+3. If within limit: transition back to CODE (or, for `design_to_review`, back to DESIGN — see below)
 4. If exhausted: record TODO and advance to next phase
+
+`design_to_review` differs from the other retry counters in one way: it is never triggered automatically by an agent. It only increments when a human explicitly requests a revision via `/on-loop-resume --feedback="..."` against a session paused at `DESIGN_REVIEW`. See `skills/on-loop-design/SKILL.md`.
 
 ### Record TODO
 
@@ -111,7 +123,9 @@ When an unrecoverable error occurs:
 |-------|-------|-------|
 | INIT | orchestrator | Workspace setup |
 | SPEC | architect | Spec generation |
-| PLAN | orchestrator | Plan from spec |
+| DESIGN | design | Scope classification and approach recommendation |
+| DESIGN_REVIEW | orchestrator | Pause state — no agent dispatched; awaits `/on-loop-resume` |
+| PLAN | orchestrator | Plan from spec and design recommendation |
 | CODE | coding | Implementation or remediation |
 | TEST | testing | Test generation and execution |
 | SECURITY | security | Security audit (read-only) |

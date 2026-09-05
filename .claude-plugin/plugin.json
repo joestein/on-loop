@@ -1,6 +1,6 @@
 {
   "name": "on-loop",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Spec-driven SDLC plugin for Claude Code — orchestrates specialist agents through a full development lifecycle with security-first engineering practices",
   "keywords": ["sdlc", "agents", "security", "spec-driven", "orchestration", "code-review", "testing"],
   "author": {
