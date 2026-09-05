@@ -22,14 +22,15 @@ Launches the **orchestrator agent** which drives the following pipeline:
 
 1. **INIT** — Creates git worktree, session directory, feature branch
 2. **SPEC** — Architect agent generates a detailed specification
-3. **PLAN** — Orchestrator writes an implementation plan
-4. **CODE** — Coding agent implements the spec
-5. **TEST** — Testing agent writes and runs tests (retries up to 3x on failure)
-6. **SECURITY** — Security agent audits the code (retries up to 2x on blockers)
-7. **DOC + BUILD** — Documentation and build agents run in parallel
-8. **REVIEW** — Reviewer agent performs final code review (retries up to 2x)
-9. **GIT** — Commit all changes from worktree, push branch, create PR
-10. **COMPLETE** — Summary of everything built with PR link (worktree left in place)
+3. **DESIGN** — Design agent classifies scope and recommends an approach. Architectural-scope changes **pause here for human approval**; bounded changes proceed automatically (see `skills/on-loop-design/SKILL.md`)
+4. **PLAN** — Orchestrator writes an implementation plan
+5. **CODE** — Coding agent implements the spec
+6. **TEST** — Testing agent writes and runs tests (retries up to 3x on failure)
+7. **SECURITY** — Security agent audits the code (retries up to 2x on blockers)
+8. **DOC + BUILD** — Documentation and build agents run in parallel
+9. **REVIEW** — Reviewer agent performs final code review (retries up to 2x)
+10. **GIT** — Commit all changes from worktree, push branch, create PR
+11. **COMPLETE** — Summary of everything built with PR link (worktree left in place)
 
 ## Instructions
 
@@ -58,7 +59,7 @@ When this command is invoked:
 5. **Initialize session directory**:
    - Create `.on-loop/sessions/<session-name>/` with `agent-notes/` subdirectory
    - Create `state.json` with:
-     - `version`: `"1.1"`
+     - `version`: `"1.2"`
      - `session_id`: the generated UUID
      - `phase`: `"INIT"`
      - `prompt`: the user's prompt
@@ -73,34 +74,41 @@ When this command is invoked:
    - Agent operates within the worktree directory
    - The architect writes the spec to `.on-loop/sessions/<session-name>/agent-notes/architect.md`
 
-7. Write `plan.md` in the session directory based on the architect's spec output.
+7. Update `state.json` to phase `"DESIGN"` and dispatch the **design agent** (`agents/design.md`):
+   - Provide `plan.md` and architect's notes
+   - Agent operates within the worktree directory (read-only)
+   - The design agent writes `.on-loop/sessions/<session-name>/agent-notes/design.md` with a classification (`BOUNDED`/`ARCHITECTURAL`), recommended approach, and an `approval_required` flag
+   - **If `approval_required: false`**: continue to step 8 automatically
+   - **If `approval_required: true`**: update `state.json` to phase `"DESIGN_REVIEW"`, print the classification, recommended approach, trade-offs, and open questions from `design.md`, and **stop**. Tell the user to run `/on-loop-resume` to approve and continue, or `/on-loop-resume --feedback="..."` to request a revision (max 2 revisions — see `skills/on-loop-design/SKILL.md`). Do not proceed further in this invocation.
 
-8. Update `state.json` to phase `"CODE"` and dispatch the **coding agent** (`agents/coding.md`):
+8. Write `plan.md` in the session directory based on the architect's spec and the design agent's recommended approach.
+
+9. Update `state.json` to phase `"CODE"` and dispatch the **coding agent** (`agents/coding.md`):
    - Provide `plan.md` and architect's notes
    - Agent operates within the worktree directory
 
-9. Update to phase `"TEST"` and dispatch the **testing agent** (`agents/testing.md`):
-   - Provide `plan.md`, architect's notes, and coding agent's notes
-   - Agent operates within the worktree directory
-   - If tests fail and retries remain (max 3), go back to CODE with test feedback
-   - If retries exhausted, record TODOs and continue
+10. Update to phase `"TEST"` and dispatch the **testing agent** (`agents/testing.md`):
+    - Provide `plan.md`, architect's notes, and coding agent's notes
+    - Agent operates within the worktree directory
+    - If tests fail and retries remain (max 3), go back to CODE with test feedback
+    - If retries exhausted, record TODOs and continue
 
-10. Update to phase `"SECURITY"` and dispatch the **security agent** (`agents/security.md`):
+11. Update to phase `"SECURITY"` and dispatch the **security agent** (`agents/security.md`):
     - Provide all prior agent notes
     - Agent operates within the worktree directory
     - If CRITICAL/HIGH findings and retries remain (max 2), go back to CODE with security feedback
     - If retries exhausted, record TODOs and continue
 
-11. Update to phase `"DOC"` and `"BUILD"` — dispatch **documentation** (`agents/documentation.md`) and **build** (`agents/build.md`) agents in parallel.
+12. Update to phase `"DOC"` and `"BUILD"` — dispatch **documentation** (`agents/documentation.md`) and **build** (`agents/build.md`) agents in parallel.
     - Both agents operate within the worktree directory
 
-12. Update to phase `"REVIEW"` and dispatch the **reviewer agent** (`agents/reviewer.md`):
+13. Update to phase `"REVIEW"` and dispatch the **reviewer agent** (`agents/reviewer.md`):
     - Provide all agent notes
     - Agent operates within the worktree directory
     - If REQUEST_CHANGES and retries remain (max 2), go back to CODE with review feedback
     - If retries exhausted, record TODOs and continue
 
-13. Update to phase `"GIT"` (orchestrator handles directly, from within the worktree):
+14. Update to phase `"GIT"` (orchestrator handles directly, from within the worktree):
     - `cd` to the worktree directory
     - Stage all modified/created files from `changes.log` (explicit paths, not `git add -A`)
     - Also stage the session directory: `.on-loop/sessions/<session-name>/`
@@ -109,7 +117,7 @@ When this command is invoked:
     - Create PR via `gh pr create` with title from prompt and body with summary, files changed, test results, security findings, TODOs
     - Store PR URL in `state.json` as `"pr_url"`
 
-14. Update to phase `"COMPLETE"`:
+15. Update to phase `"COMPLETE"`:
     - Update session state.json with `phase: "COMPLETE"`
     - Update `.on-loop/index.json` session entry: `status: "complete"`, `completed_at`, `pr_url`
     - **Do NOT remove the worktree** — leave it in place for `/on-loop-continue` or manual use. Use `/on-loop:clear` to clean up worktrees.
@@ -121,6 +129,8 @@ When this command is invoked:
     - Display the PR URL
 
 ## Error Handling
+
+`DESIGN_REVIEW` is a planned pause for human approval, not a failure — session status stays `"active"` and the worktree is left untouched either way.
 
 If any phase fails unexpectedly:
 - Set `state.json` phase to `"FAILED"` with error details

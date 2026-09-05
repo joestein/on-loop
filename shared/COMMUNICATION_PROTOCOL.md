@@ -27,6 +27,8 @@ Each session also has a UUID (`session_id`) for lock coordination, but the **dir
     │   ├── changes.log             # Append-only file modification log
     │   └── agent-notes/
     │       ├── architect.md        # Architect agent output
+    │       ├── design.md           # Design agent output (classification, approaches, recommendation)
+    │       ├── design-feedback.md  # Human feedback from a DESIGN_REVIEW revision request (if any)
     │       ├── coding.md           # Coding agent output
     │       ├── testing.md          # Testing agent output
     │       ├── security.md         # Security agent output
@@ -78,19 +80,21 @@ Each session operates in a **git worktree** at `.claude/worktrees/<branch-slug>/
 
 ```json
 {
-  "version": "1.1",
+  "version": "1.2",
   "loop_id": "<uuid>",
   "session_id": "<uuid>",
   "prompt": "<original user prompt>",
-  "phase": "INIT | SPEC | PLAN | CODE | TEST | SECURITY | DOC | BUILD | REVIEW | GIT | COMPLETE | FAILED",
+  "phase": "INIT | SPEC | DESIGN | DESIGN_REVIEW | PLAN | CODE | TEST | SECURITY | DOC | BUILD | REVIEW | GIT | COMPLETE | FAILED",
   "started_at": "<ISO 8601>",
   "updated_at": "<ISO 8601>",
   "retries": {
+    "design_to_review": 0,
     "test_to_code": 0,
     "security_to_code": 0,
     "review_to_code": 0
   },
   "max_retries": {
+    "design_to_review": 2,
     "test_to_code": 3,
     "security_to_code": 2,
     "review_to_code": 2
@@ -176,6 +180,8 @@ Each agent writes structured notes to `<session-dir>/agent-notes/<agent>.md`:
 ## Recommendations for Next Agent
 - <actionable recommendation>
 ```
+
+`design.md` is the one documented exception to this shape — it uses `## Classification`, `## Approaches Considered`, `## Recommended Approach`, `## Impact on Plan`, and `## Approval` instead, since its job is a decision record, not a work summary. See `agents/design.md`.
 
 ### Severity Levels (for Issues)
 

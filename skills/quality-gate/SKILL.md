@@ -9,7 +9,7 @@ This skill defines the quality criteria that must be met before transitioning be
 
 All paths below use `<session-dir>` to refer to the active session directory (e.g., `.on-loop/sessions/20260426_143052_user-management-api/`).
 
-## Gate: SPEC → PLAN
+## Gate: SPEC → DESIGN
 
 **Check**: Architect agent notes exist and contain a valid specification.
 
@@ -22,6 +22,36 @@ All paths below use `<session-dir>` to refer to the active session directory (e.
 | Architecture diagram present | Recommended |
 
 **On fail**: Cannot proceed. Report to user.
+
+## Gate: DESIGN → PLAN or DESIGN_REVIEW
+
+**Check**: Design agent notes exist with a classification and a recommendation. See `skills/on-loop-design/SKILL.md` for the full mechanics.
+
+| Criteria | Required |
+|----------|----------|
+| `<session-dir>/agent-notes/design.md` exists | Yes |
+| `## Classification` is `BOUNDED` or `ARCHITECTURAL` | Yes |
+| `## Recommended Approach` is non-empty | Yes |
+| `## Approval` states `approval_required: true` or `false` | Yes |
+
+**Routing** (not pass/fail — both outcomes are valid):
+- `approval_required: false` → transition to `PLAN` automatically
+- `approval_required: true` → transition to `DESIGN_REVIEW` and stop; resumes via `/on-loop-resume`
+
+**On fail** (missing notes or missing classification/approval fields): Cannot proceed. Re-dispatch the design agent.
+
+## Gate: DESIGN_REVIEW → PLAN
+
+**Check**: Human has responded to the pause.
+
+| Criteria | Required |
+|----------|----------|
+| `/on-loop-resume` invoked against the paused session | Yes |
+| If `--feedback` given, revision was written and design agent re-run | Yes |
+
+**On approval** (no `--feedback`): proceed to `PLAN` using the existing recommendation.
+**On feedback (retries remain)**: transition back to `DESIGN` with the feedback, re-run the design agent (max 2 revisions).
+**On feedback (retries exhausted)**: record a `HIGH` TODO with the unresolved feedback, proceed to `PLAN` with the latest recommendation, and say so explicitly.
 
 ## Gate: PLAN → CODE
 
@@ -119,11 +149,12 @@ All paths below use `<session-dir>` to refer to the active session directory (e.
 
 | Transition | Max Retries | Trigger |
 |-----------|-------------|---------|
+| DESIGN_REVIEW → DESIGN | 2 | Human-requested revision via `/on-loop-resume --feedback` |
 | TEST → CODE | 3 | Test failures |
 | SECURITY → CODE | 2 | CRITICAL/HIGH findings |
 | REVIEW → CODE | 2 | REQUEST_CHANGES verdict |
 
-Total maximum code iterations: 1 (initial) + 3 + 2 + 2 = **8**
+Total maximum code iterations: 1 (initial) + 3 + 2 + 2 = **8** (unaffected by design revisions, which happen before CODE starts)
 
 ## Exhausted Retry Behavior
 

@@ -8,7 +8,7 @@
       "name": "on-loop",
       "description": "Spec-driven SDLC loop with orchestrated specialist agents",
       "source": "./",
-      "version": "0.6.1"
+      "version": "0.7.0"
     }
   ]
 }
