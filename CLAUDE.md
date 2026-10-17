@@ -4,7 +4,7 @@ Spec-driven SDLC plugin that orchestrates specialist agents through a full devel
 
 ## Commands
 
-- `/on-loop <prompt>` — Run full SDLC loop (spec -> code -> test -> security -> docs -> build -> review -> git)
+- `/on-loop <prompt>` — Run full SDLC loop (spec -> design -> code -> test -> security -> docs -> build -> review -> git)
 - `/on-loop-continue <prompt>` — Continue work in an existing on-loop worktree (full SDLC pipeline, commits and pushes, no new worktree or PR)
 - `/on-loop-check [PR number or branch]` — Check GitHub CI status, fix regressions, alert on pre-existing failures
 - `/on-loop-debug-fix [description or image] [--complexity=level]` — Debug and fix issues from infrastructure logs or user-provided context
@@ -56,6 +56,7 @@ Worktrees at `.claude/worktrees/` are gitignored and temporary:
 |-------|------|
 | orchestrator | Pipeline control, quality gates, retry logic, worktree/session lifecycle |
 | architect | Spec generation, ADRs, system design |
+| design | Scope classification, approach exploration, human approval gate for architectural work |
 | coding | Implementation with security-first practices |
 | testing | Unit, integration, and E2E tests |
 | security | OWASP/STRIDE audit, compliance checks |
@@ -91,3 +92,4 @@ Multiple sessions can work on the same feature concurrently using `/on-continue`
 | `skills/roadmap-lock/` | Lock acquisition, release, heartbeat, stale detection |
 | `skills/quality-gate/` | Pass/fail criteria for phase transitions |
 | `skills/loop-state/` | On-loop phase state transitions and validation |
+| `skills/on-loop-design/` | DESIGN phase mechanics: scope classification, approach exploration, human approval gate |

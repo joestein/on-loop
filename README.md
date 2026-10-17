@@ -7,8 +7,10 @@ Spec-driven SDLC plugin for [Claude Code](https://docs.anthropic.com/en/docs/cla
 `/on-loop` takes a prompt and runs it through a complete software development pipeline:
 
 ```
-Prompt → Worktree → Branch → Spec → Plan → Code → Test → Security → Docs + Build → Review → Commit + Push + PR → Done
+Prompt → Worktree → Branch → Spec → Design → Plan → Code → Test → Security → Docs + Build → Review → Commit + Push + PR → Done
 ```
+
+The **Design** step classifies the change and, for architectural-scope work, pauses the loop for explicit human approval before any code is written — see [Design Gate](#design-gate) below.
 
 Each phase is handled by a specialist agent operating as a Staff Engineer with ISC2 certifications, building for regulated financial environments and critical infrastructure.
 
@@ -59,7 +61,7 @@ Clone or copy into your project and reference it in your project's Claude Code c
 | `/on-loop-check [PR number or branch]` | Check GitHub CI status, fix regressions, alert on pre-existing failures |
 | `/on-loop-debug-fix [description or image]` | Debug and fix issues from infrastructure logs or user-provided context |
 | `/on-loop-status` | Check progress of current and past sessions |
-| `/on-loop-resume [--from=phase] [--session=<id>]` | Resume an interrupted loop |
+| `/on-loop-resume [--from=phase] [--session=<id>] [--feedback="..."]` | Resume an interrupted loop, or approve/revise a paused Design Gate |
 | `/on-loop:clear [--include-logs]` | Clean up worktrees, optionally remove session logs |
 | `/on-loop:main-resolve` | Pull main, merge into branch, resolve conflicts |
 | `/on-spec <description>` | Standalone spec generation |
@@ -84,6 +86,7 @@ Clone or copy into your project and reference it in your project's Claude Code c
 |-------|-------|------|
 | Orchestrator | Opus | Pipeline control, quality gates, retry logic, worktree/session lifecycle |
 | Architect | Opus | Spec generation, ADRs, system design |
+| Design | Opus | Scope classification, approach exploration, human approval gate for architectural work |
 | Coding | Opus | Implementation with security-first practices |
 | Testing | Sonnet | Unit, integration, and E2E tests |
 | Security | Opus | OWASP/STRIDE audit, compliance checks (read-only) |
@@ -97,7 +100,11 @@ Clone or copy into your project and reference it in your project's Claude Code c
 graph TD
     START["/on-loop prompt"] --> INIT["INIT: Session + Worktree + Branch"]
     INIT --> SPEC["SPEC: Architect Agent (in worktree)"]
-    SPEC --> PLAN["PLAN: Orchestrator writes plan"]
+    SPEC --> DESIGN["DESIGN: Design Agent classifies + recommends"]
+    DESIGN -->|Bounded| PLAN["PLAN: Orchestrator writes plan"]
+    DESIGN -->|Architectural| REVIEW_GATE["DESIGN_REVIEW: paused, awaiting human approval"]
+    REVIEW_GATE -->|"/on-loop-resume"| PLAN
+    REVIEW_GATE -->|"/on-loop-resume --feedback (max 2x)"| DESIGN
     PLAN --> CODE["CODE: Coding Agent (in worktree)"]
     CODE --> TEST["TEST: Testing Agent (in worktree)"]
     TEST -->|Pass| SEC["SECURITY: Security Agent (in worktree)"]
@@ -140,19 +147,32 @@ Session directories are named with timestamps for chronological sorting and bran
 
 Session directories are committed to the repo as audit logs, providing a record of what the AI agents did, decided, and found.
 
+### Design Gate
+
+Between SPEC and PLAN, the **design agent** classifies the change and decides whether a human needs to weigh in before any code is written. This is adapted from [superpowers'](https://github.com/obra/superpowers) `brainstorming` skill: explore approaches, recommend one, and gate implementation behind approval — fit to on-loop's autonomous, resumable pipeline instead of a synchronous chat turn.
+
+- **Bounded** (a change to a flow that already exists in the repo): the design agent picks the approach that fits the existing pattern, writes a short rationale to `design.md`, and the loop continues straight to PLAN. The PR review at the end is still the human checkpoint, same as any other on-loop change.
+- **Architectural** (new subsystem, new schema, new/changed external interface): the design agent proposes 2-3 approaches with trade-offs, recommends one, and the loop **pauses** at `DESIGN_REVIEW` — no code gets written until a human responds:
+  - `/on-loop-resume` — approve the recommendation and continue to PLAN
+  - `/on-loop-resume --feedback="..."` — request a revision (up to 2 rounds, then the loop proceeds with the latest recommendation and a recorded TODO)
+
+The design doc lives at `.on-loop/sessions/<session-name>/agent-notes/design.md` alongside every other agent's notes. See `skills/on-loop-design/SKILL.md` for the full classification criteria and gate mechanics.
+
 ### Quality Gates
 
 Each phase transition is validated:
 
 | Transition | Key Criteria |
 |-----------|--------------|
+| DESIGN -> PLAN or DESIGN_REVIEW | Classification and recommendation present; routes on `approval_required` |
+| DESIGN_REVIEW -> PLAN | Human approved, or feedback rounds exhausted |
 | CODE -> TEST | Code compiles, no self-reported critical issues |
 | TEST -> SECURITY | All tests pass |
 | SECURITY -> DOC/BUILD | No critical/high security findings |
 | REVIEW -> GIT | Reviewer approves |
 | GIT -> COMPLETE | Commit, push, PR created |
 
-Failed gates trigger retries (TEST->CODE: 3x, SECURITY->CODE: 2x, REVIEW->CODE: 2x). After exhaustion, issues are recorded as TODOs and the pipeline continues.
+Failed gates trigger retries (DESIGN_REVIEW->DESIGN: 2x on human feedback, TEST->CODE: 3x, SECURITY->CODE: 2x, REVIEW->CODE: 2x). After exhaustion, issues are recorded as TODOs and the pipeline continues.
 
 ## Agent Persona
 
