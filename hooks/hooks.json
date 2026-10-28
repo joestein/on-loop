@@ -1,17 +1,25 @@
 {
-  "hooks": [
-    {
-      "name": "on-loop-active-reminder",
-      "description": "Reminds the user about active on-loop sessions when the agent stops",
-      "event": "Stop",
-      "command": "if [ -f .on-loop/index.json ]; then ACTIVE=$(python3 -c \"import json; d=json.load(open('.on-loop/index.json')); sessions=[s for s in d.get('sessions',[]) if s['status']=='active']; [print(f\\\"  {s['session_id'][:8]}... phase: {s.get('branch','?')}\\\") for s in sessions]; print(len(sessions))\" 2>/dev/null | tail -1); if [ -n \"$ACTIVE\" ] && [ \"$ACTIVE\" != '0' ]; then echo \"⚠️  $ACTIVE active on-loop session(s) detected. Use /on-loop-status to check progress or /on-loop-resume to continue.\"; fi; fi"
-    },
-    {
-      "name": "on-loop-change-tracker",
-      "description": "Tracks file modifications during an active on-loop session",
-      "event": "PostToolUse",
-      "tools": ["Write", "Edit"],
-      "command": "if [ -f .on-loop/index.json ]; then TOOL_NAME=\"$CLAUDE_TOOL_NAME\"; FILE_PATH=\"$CLAUDE_FILE_PATH\"; if [ -n \"$FILE_PATH\" ]; then SESSION_DIR=$(python3 -c \"import json; d=json.load(open('.on-loop/index.json')); sessions=[s for s in d.get('sessions',[]) if s['status']=='active']; print(sessions[-1]['session_dir'] if sessions else '')\" 2>/dev/null); if [ -n \"$SESSION_DIR\" ] && [ -f \"$SESSION_DIR/changes.log\" ]; then TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ); AGENT=$(python3 -c \"import json; d=json.load(open('$SESSION_DIR/state.json')); print(d.get('current_agent','unknown'))\" 2>/dev/null); ACTION='MODIFY'; if [ \"$TOOL_NAME\" = 'Write' ]; then ACTION='CREATE'; fi; printf '[%s] %s %s %s — tracked by hook\\n' \"$TIMESTAMP\" \"$AGENT\" \"$ACTION\" \"$FILE_PATH\" >> \"$SESSION_DIR/changes.log\"; fi; fi; fi"
-    }
-  ]
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f .on-loop/index.json ]; then ACTIVE=$(python3 -c \"import json; d=json.load(open('.on-loop/index.json')); sessions=[s for s in d.get('sessions',[]) if s['status']=='active']; [print(f\\\"  {s['session_id'][:8]}... phase: {s.get('branch','?')}\\\") for s in sessions]; print(len(sessions))\" 2>/dev/null | tail -1); if [ -n \"$ACTIVE\" ] && [ \"$ACTIVE\" != '0' ]; then echo \"⚠️  $ACTIVE active on-loop session(s) detected. Use /on-loop-status to check progress or /on-loop-resume to continue.\"; fi; fi"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f .on-loop/index.json ]; then TOOL_NAME=\"$CLAUDE_TOOL_NAME\"; FILE_PATH=\"$CLAUDE_FILE_PATH\"; if [ -n \"$FILE_PATH\" ]; then SESSION_DIR=$(python3 -c \"import json; d=json.load(open('.on-loop/index.json')); sessions=[s for s in d.get('sessions',[]) if s['status']=='active']; print(sessions[-1]['session_dir'] if sessions else '')\" 2>/dev/null); if [ -n \"$SESSION_DIR\" ] && [ -f \"$SESSION_DIR/changes.log\" ]; then TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ); AGENT=$(python3 -c \"import json; d=json.load(open('$SESSION_DIR/state.json')); print(d.get('current_agent','unknown'))\" 2>/dev/null); ACTION='MODIFY'; if [ \"$TOOL_NAME\" = 'Write' ]; then ACTION='CREATE'; fi; printf '[%s] %s %s %s — tracked by hook\\n' \"$TIMESTAMP\" \"$AGENT\" \"$ACTION\" \"$FILE_PATH\" >> \"$SESSION_DIR/changes.log\"; fi; fi; fi"
+          }
+        ]
+      }
+    ]
+  }
 }

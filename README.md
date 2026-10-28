@@ -1,6 +1,6 @@
 # On-Loop
 
-Spec-driven SDLC plugin for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that orchestrates specialist agents through a full development lifecycle with security-first engineering practices.
+Spec-driven SDLC workflows for AI coding tools: a native [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin and portable Agent Skills for Codex, Gemini CLI, OpenCode, and compatible hosts. Specialist roles guide a full development lifecycle with security-first engineering practices.
 
 ## What It Does
 
@@ -12,9 +12,25 @@ Prompt → Worktree → Branch → Spec → Plan → Code → Test → Security 
 
 Each phase is handled by a specialist agent operating as a Staff Engineer with ISC2 certifications, building for regulated financial environments and critical infrastructure.
 
-Each session operates in its own **git worktree**, so multiple sessions can run concurrently on the same repo without interference. Session logs are persisted in the repo as an audit trail.
+The native Claude plugin gives each session its own **git worktree**, so multiple sessions can run concurrently on the same repo without interference. Portable workflows follow the host's workspace policy and reuse isolated cloud checkouts. Session logs are persisted in the repo as an audit trail.
 
 ## Installation
+
+### Codex, Gemini CLI, OpenCode, and other Agent Skills hosts
+
+From this checkout, export the workflows into your project (Python 3.9+):
+
+```bash
+python3 bin/on-loop-export --tool codex --destination /path/to/your-project
+# Other targets: --tool gemini, --tool opencode, --tool agent-skills
+```
+
+The portable workflows use the model/provider selected in your coding tool.
+They retain the existing roles and quality gates, with sequential execution when
+delegation is unavailable. See [portable tool setup](docs/portable-tools.md) for
+invocation, permissions, and differences from the native Claude plugin.
+
+### Claude Code
 
 ### Option 1: Marketplace (recommended)
 
@@ -78,9 +94,37 @@ Clone or copy into your project and reference it in your project's Claude Code c
 | `/on-continue [feature-slug]` | Pick up next available step and execute through agent pipeline |
 | `/on-pause [feature-slug]` | Release locks, commit WIP, write handoff summary |
 
+## Safe release tagging
+
+On 2026-05-20, untracked `.on-loop/sessions/` files caused `git pull` to abort silently (git refuses to overwrite untracked paths). The local branch was left one commit behind `origin/main`. The developer did not notice, signed the tag, and `v0.2.3` was created against the previous release's commit. The Quay image for v0.2.3 therefore contained v0.2.2 code.
+
+`on-loop-tag` is a pre-flight gate that runs eight checks before invoking `git tag -s`, and writes an immutable NDJSON audit line to `.on-loop/release-log.json` on every outcome (success, refusal, or emergency bypass). The exact precondition of the v0.2.3 incident is caught by checks 5 and 6.
+
+```bash
+# Normal — all eight checks must pass
+on-loop-tag v0.6.2 -m "release: v0.6.2"
+
+# Dry run — check only, no tag, no audit line
+on-loop-tag v0.6.2 -m "release: v0.6.2" --check
+
+# Emergency bypass — all checks still run; failures become warnings
+on-loop-tag v0.6.2 -m "hotfix" --force --reason "CI down, hotfix for prod INC-4892"
+```
+
+After a successful tag, push manually: `git push origin v0.6.2`
+
+See [`bin/on-loop-tag.md`](bin/on-loop-tag.md) for the full manual: all eight checks, exit codes, audit log schema, `--force` policy, security considerations, and install trade-offs.
+
+Installed to `~/.local/bin/on-loop-tag` by `setup/fedora-bootstrap.sh`.
+
+This tool implements the **canonical-state-verification iteration** of [mise-en-place Principle 5 (Justified Action / Five Whys), §5 Forward](https://github.com/UlyssesModel/mise-en-place/blob/main/skills/mise-en-place/references/contract.md#5-justified-action) — applied to `git tag` operations. The eight pre-flight checks are the reference pattern for destructive-op tooling; the discipline generalizes to schema migrations, deployments, and any irreversible operation. See mise-en-place v0.5.1 (2026-05-21) for the architectural authority.
+
 ## Agents
 
-| Agent | Model | Role |
+The native Claude plugin uses the defaults below. Portable skills inherit the
+host's model selection for every role.
+
+| Agent | Claude default | Role |
 |-------|-------|------|
 | Orchestrator | Opus | Pipeline control, quality gates, retry logic, worktree/session lifecycle |
 | Architect | Opus | Spec generation, ADRs, system design |

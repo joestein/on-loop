@@ -1,0 +1,131 @@
+# .github/workflows/on-loop-tag.yml
+#
+# CI for the release-tagging script and portable workflow exports.
+#
+# Runs shellcheck (SAST), the 16-case bats suite, and portable skill tests on push
+# and on pull requests targeting main.  The workflow is path-filtered so it
+# only executes when files relevant to the script or its tests change.
+#
+# Spec reference: session agent-notes/architect.md §7.7, §12 (constraints)
+# Coding notes:   agent-notes/coding.md  (shellcheck-clean claim, D-B shim)
+# Testing notes:  agent-notes/testing.md (bats --jobs 1, OQ-4)
+
+name: on-loop tests
+
+on:
+  push:
+    paths:
+      - "bin/on-loop-tag"
+      - "bin/on-loop-tag.md"
+      - "bin/on-loop-export"
+      - "adapters/**"
+      - "agents/**"
+      - "commands/**"
+      - "skills/**"
+      - "shared/**"
+      - "tests/**"
+      - "setup/fedora-bootstrap.sh"
+      - "Makefile"
+      - ".gitignore"
+      - ".github/workflows/on-loop-tag.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "bin/on-loop-tag"
+      - "bin/on-loop-tag.md"
+      - "bin/on-loop-export"
+      - "adapters/**"
+      - "agents/**"
+      - "commands/**"
+      - "skills/**"
+      - "shared/**"
+      - "tests/**"
+      - "setup/fedora-bootstrap.sh"
+      - "Makefile"
+      - ".gitignore"
+      - ".github/workflows/on-loop-tag.yml"
+
+jobs:
+  tag-script-tests:
+    name: shellcheck + bats + portable skills
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history: git rev-list-style operations in the worktree and
+          # any test-meta scenarios that inspect commit ancestry work correctly.
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # System dependencies
+      #
+      # ubuntu-latest ships util-linux (flock), git, and jq already; we pin
+      # them explicitly so the job fails fast if any is removed rather than
+      # producing a silent wrong-tool error.
+      #
+      # bats in apt (Ubuntu 22.04 / 24.04) may be 1.2.x which lacks features
+      # used by this suite.  We check the installed version; if it is older
+      # than 1.7.0 (or missing), we install bats-core from source instead.
+      # -----------------------------------------------------------------------
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y bats jq util-linux shellcheck
+
+      - name: Ensure bats >= 1.7 (install from source if apt version is too old)
+        run: |
+          # Check whether the apt-installed bats is new enough.
+          # "bats --version" prints e.g. "Bats 1.2.1" or "Bats 1.10.0".
+          if bats_out=$(bats --version 2>/dev/null); then
+            bats_ver=$(echo "$bats_out" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+            bats_major=$(echo "$bats_ver" | cut -d. -f1)
+            bats_minor=$(echo "$bats_ver" | cut -d. -f2)
+            echo "Detected bats ${bats_ver}"
+            # Accept 1.7+ or any 2.x+
+            if [[ "$bats_major" -ge 2 ]] || { [[ "$bats_major" -eq 1 ]] && [[ "$bats_minor" -ge 7 ]]; }; then
+              echo "bats version OK — skipping source install."
+              exit 0
+            fi
+            echo "bats ${bats_ver} is too old (need >= 1.7); installing bats-core from source."
+          else
+            echo "bats not found via apt; installing bats-core from source."
+          fi
+          # Clone bats-core at a pinned, auditable tag (1.11.0 as of 2025-08).
+          git clone --depth 1 --branch "v1.11.0" \
+            https://github.com/bats-core/bats-core.git /tmp/bats-core
+          sudo /tmp/bats-core/install.sh /usr/local
+          echo "Installed: $(bats --version)"
+
+      # -----------------------------------------------------------------------
+      # SAST: shellcheck
+      #
+      # Exits non-zero on any warning or error (shellcheck default).
+      # Security agent confirmed script is written shellcheck-clean.
+      # Any regression surfaced here routes back to the coding agent.
+      # -----------------------------------------------------------------------
+      - name: Run shellcheck on bin/on-loop-tag
+        run: shellcheck bin/on-loop-tag
+
+      # -----------------------------------------------------------------------
+      # Test suite: bats
+      #
+      # --jobs 1 is mandatory: each test mutates $PATH and cwd.
+      # Architect OQ-4 and testing-agent notes both require sequential execution.
+      #
+      # The script's git-tag-signing shim (architect §7.2, coding D-B) intercepts
+      # "git tag -s" and rewrites to "git tag -a", avoiding GPG agent dependency.
+      # The BATS_VERSION env var is automatically set by bats-core so the script's
+      # ON_LOOP_TAG_FORCE_TTY_INPUT gate fires correctly in tests 1 and 11.
+      # -----------------------------------------------------------------------
+      - name: Run bats test suite
+        run: bats --jobs 1 tests/test_on_loop_tag.bats
+
+      - name: Test portable skill exports
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v

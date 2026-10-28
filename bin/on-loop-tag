@@ -1,0 +1,1131 @@
+#!/usr/bin/env bash
+# on-loop-tag — Layer 1 safe release tagging CLI.
+#
+# Runs eight verbatim pre-flight checks before invoking `git tag -s`, and
+# appends a structured NDJSON line to `.on-loop/release-log.json` on every
+# tagging outcome (success, refusal, force-bypass, error).
+#
+# Spec: .on-loop/sessions/20260520_214047_on-loop-tag-layer-1/agent-notes/architect.md
+#
+# Exit codes (see architect §2.3):
+#   0 E_OK              — tag created, --check all-pass, or user-declined cleanly
+#   1 E_CHECK_FAIL      — one or more pre-flight checks failed (non-force mode)
+#   2 E_USAGE           — bad CLI arguments
+#   3 E_NO_REPO         — not inside a git repository (or missing dependency)
+#   4 E_GIT_TAG_FAILED  — git tag -s itself failed
+#   5 E_FETCH_FAILED    — git fetch origin failed
+#   6 E_SIGNAL_INT      — interrupted by SIGINT/SIGTERM
+#   7 E_NO_TTY          — interactive confirmation needed but stdin is not a TTY
+#   8 E_LOCK_TIMEOUT    — audit-log lock could not be acquired within 5 s
+#   9 E_AUDIT_FAILED    — tag created but audit-log append failed
+
+set -euo pipefail
+IFS=$'\n\t'
+umask 022
+
+# ------------------------------------------------------------------------------
+# Exit code constants (spec §2.3)
+# ------------------------------------------------------------------------------
+readonly E_OK=0
+readonly E_CHECK_FAIL=1
+readonly E_USAGE=2
+readonly E_NO_REPO=3
+readonly E_GIT_TAG_FAILED=4
+readonly E_FETCH_FAILED=5
+readonly E_SIGNAL_INT=6
+readonly E_NO_TTY=7
+readonly E_LOCK_TIMEOUT=8
+readonly E_AUDIT_FAILED=9
+
+# ------------------------------------------------------------------------------
+# Globals populated by argv parsing and check execution.
+# ------------------------------------------------------------------------------
+TAG=""
+MESSAGE=""
+MODE_CHECK=0
+MODE_FORCE=0
+REASON=""
+REASON_SET=0
+MESSAGE_SET=0
+
+# Check accounting (architect §5.2)
+CHECKS_PASSED=()
+CHECKS_FAILED=()
+CHECKS_SKIPPED=()
+SCRIPT_VERSION="unknown"
+
+# Set to 1 by check_main_synced if `git fetch origin main` fails. The
+# orchestrator branches on this to emit an action:error audit line and
+# exit "$E_FETCH_FAILED" (architect §5.5, B1 retry fix).
+FETCH_FAILED=0
+
+# Audit append guard — when 1, the INT/TERM trap should NOT emit an extra error
+# audit line because we are inside the post-tag critical section.
+TRAP_ARMED=0
+
+# Repo root (set by resolve_repo_root)
+REPO_ROOT=""
+
+# Verified HEAD SHA captured immediately after the seven pre-flight checks
+# complete. The tag is pinned to this SHA at `git tag -s` time, so HEAD
+# movement between pre-flight and signing causes a refusal rather than a
+# wrong-commit tag (Round-1 Finding 1 fix — closes a v0.2.3-class failure
+# vector that affects non-pull-abort cases like concurrent reset/checkout).
+VERIFIED_SHA=""
+
+USAGE_LINE='usage: on-loop-tag <TAG> -m <MESSAGE> [--check] [--force --reason <TEXT>]'
+
+# ==============================================================================
+# Helpers
+# ==============================================================================
+
+print_usage() {
+  printf '%s\n' "$USAGE_LINE" >&2
+}
+
+# error_usage <message>: print "error: <message>" + usage to stderr, exit E_USAGE.
+error_usage() {
+  local msg="$1"
+  printf 'error: %s\n' "$msg" >&2
+  print_usage
+  exit "$E_USAGE"
+}
+
+# now_utc: current UTC timestamp in ISO 8601 (architect §5.2)
+now_utc() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# current_user: id -un with fallback (architect §8.14)
+current_user() {
+  local u
+  u="$(id -un 2>/dev/null || true)"
+  if [[ -z "$u" ]]; then
+    u="${USER:-unknown}"
+  fi
+  printf '%s' "$u"
+}
+
+# read_script_version: read .version from .claude-plugin/plugin.json.
+# Architect §4.1, §5.2: use jq if available; fallback literal "unknown".
+read_script_version() {
+  local plugin_json="$REPO_ROOT/.claude-plugin/plugin.json"
+  if [[ -f "$plugin_json" ]] && command -v jq >/dev/null 2>&1; then
+    local v
+    v="$(jq -r '.version // "unknown"' "$plugin_json" 2>/dev/null || true)"
+    if [[ -n "$v" && "$v" != "null" ]]; then
+      printf '%s' "$v"
+      return 0
+    fi
+  fi
+  printf 'unknown'
+}
+
+# json_escape_string <text>: emit a JSON-encoded string (including quotes).
+# Uses jq -Rs . if available; else bash escape per architect S-2 (\ first,
+# then ", then control chars).
+json_escape_string() {
+  local text="$1"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$text" | jq -Rs .
+    return 0
+  fi
+
+  # Fallback: escape backslash first, then double-quote, then control chars.
+  local out="$text"
+  out="${out//\\/\\\\}"
+  out="${out//\"/\\\"}"
+
+  # Per-character pass for control chars (0x00-0x1F) and DEL.
+  local result=""
+  local i ch code hex
+  local len=${#out}
+  for (( i=0; i<len; i++ )); do
+    ch="${out:i:1}"
+    # printf %d on a single-char "'<ch>" yields the byte value (bash builtin).
+    code=$(LC_ALL=C printf '%d' "'$ch")
+    case "$code" in
+      8)  result+='\b' ;;
+      9)  result+='\t' ;;
+      10) result+='\n' ;;
+      12) result+='\f' ;;
+      13) result+='\r' ;;
+      *)
+        if (( code < 32 || code == 127 )); then
+          hex=$(printf '%04x' "$code")
+          result+="\\u${hex}"
+        else
+          result+="$ch"
+        fi
+        ;;
+    esac
+  done
+  printf '"%s"' "$result"
+}
+
+# json_array <token...>: emit a JSON array of strings from positional args.
+json_array() {
+  local first=1 token escaped
+  printf '['
+  for token in "$@"; do
+    if (( first )); then
+      first=0
+    else
+      printf ','
+    fi
+    escaped=$(json_escape_string "$token")
+    printf '%s' "$escaped"
+  done
+  printf ']'
+}
+
+# build_audit_line ... : compose a single NDJSON line per schema v1.
+# Reads check arrays directly from globals CHECKS_PASSED / CHECKS_FAILED /
+# CHECKS_SKIPPED to avoid any CSV-serialization round-trip (which would be
+# fragile under the script-wide IFS=$'\n\t').
+#
+# Required positional args (architect §5.2, all 13 fields):
+#   1 ts             ISO 8601 string
+#   2 user           string
+#   3 tag            string
+#   4 commit         SHA string or "" (null when empty)
+#   5 action         "tagged"|"refused"|"error"
+#   6 force          "true"|"false"
+#   7 reason         text or "" (null when empty AND force is false)
+#   8 refused_reason text or "" (null when empty)
+#   9 error_code     integer or "" (null when empty)
+#  10 script_version string
+build_audit_line() {
+  local ts="$1" user="$2" tag="$3" commit="$4" action="$5" force="$6"
+  local reason="$7" refused_reason="$8" error_code="$9" script_version="${10}"
+
+  # Reason field — JSON null when empty AND force is false; otherwise encoded.
+  local reason_json
+  if [[ "$force" == "true" || -n "$reason" ]]; then
+    reason_json=$(json_escape_string "$reason")
+  else
+    reason_json="null"
+  fi
+
+  local commit_json
+  if [[ -n "$commit" ]]; then
+    commit_json=$(json_escape_string "$commit")
+  else
+    commit_json="null"
+  fi
+
+  local refused_reason_json
+  if [[ -n "$refused_reason" ]]; then
+    refused_reason_json=$(json_escape_string "$refused_reason")
+  else
+    refused_reason_json="null"
+  fi
+
+  local error_code_json
+  if [[ -n "$error_code" ]]; then
+    error_code_json="$error_code"
+  else
+    error_code_json="null"
+  fi
+
+  local ts_json user_json tag_json action_json script_version_json
+  ts_json=$(json_escape_string "$ts")
+  user_json=$(json_escape_string "$user")
+  tag_json=$(json_escape_string "$tag")
+  action_json=$(json_escape_string "$action")
+  script_version_json=$(json_escape_string "$script_version")
+
+  local passed_json failed_json skipped_json
+  passed_json=$(json_array "${CHECKS_PASSED[@]+"${CHECKS_PASSED[@]}"}")
+  failed_json=$(json_array "${CHECKS_FAILED[@]+"${CHECKS_FAILED[@]}"}")
+  skipped_json=$(json_array "${CHECKS_SKIPPED[@]+"${CHECKS_SKIPPED[@]}"}")
+
+  printf '{"schema_version":1,"ts":%s,"user":%s,"tag":%s,"commit":%s,"action":%s,"force":%s,"reason":%s,"checks_passed":%s,"checks_failed":%s,"checks_skipped":%s,"refused_reason":%s,"error_code":%s,"script_version":%s}' \
+    "$ts_json" "$user_json" "$tag_json" "$commit_json" "$action_json" "$force" \
+    "$reason_json" "$passed_json" "$failed_json" "$skipped_json" \
+    "$refused_reason_json" "$error_code_json" "$script_version_json"
+}
+
+# audit_append <line>: atomically append a single NDJSON line.
+# Returns 0 on success, 8 on lock timeout, 9 on write failure.
+audit_append() {
+  local line="$1"
+  local log="$REPO_ROOT/.on-loop/release-log.json"
+  local lock="$REPO_ROOT/.on-loop/release-log.json.lock"
+
+  mkdir -p "$REPO_ROOT/.on-loop"
+
+  # Touch lock file (0644 via umask 022).
+  : >> "$lock"
+
+  exec 9>"$lock"
+  if ! flock -x -w 5 9; then
+    exec 9>&-
+    printf 'CRITICAL: could not acquire audit lock within 5s: %s\n' "$lock" >&2
+    return "$E_LOCK_TIMEOUT"
+  fi
+
+  if ! printf '%s\n' "$line" >> "$log"; then
+    exec 9>&-
+    return "$E_AUDIT_FAILED"
+  fi
+
+  exec 9>&-
+  return 0
+}
+
+# emit_audit <action> <force> <reason> <refused_reason> <error_code> [<commit_override>]
+# Builds and writes a single audit line. Returns the audit_append exit code.
+# When commit_override is supplied (success path), it is used verbatim instead
+# of a fresh `git rev-parse HEAD` — required so the audit `commit` field names
+# the SHA the tag actually points at, even if HEAD moved after `git tag -s`
+# (Round-1 Finding 2 fix). Callers on the success path pass the tag-target
+# resolved via `git rev-parse "$TAG^{commit}"`.
+emit_audit() {
+  local action="$1" force="$2" reason="$3" refused_reason="$4" error_code="$5"
+  local commit_override="${6:-}"
+
+  local ts user commit
+  ts=$(now_utc)
+  user=$(current_user)
+  commit=""
+  if [[ -n "$commit_override" ]]; then
+    commit="$commit_override"
+  elif [[ -n "$REPO_ROOT" ]]; then
+    commit=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)
+  fi
+
+  local line
+  line=$(build_audit_line \
+    "$ts" "$user" "$TAG" "$commit" "$action" "$force" \
+    "$reason" "$refused_reason" "$error_code" "$SCRIPT_VERSION")
+
+  audit_append "$line"
+}
+
+# audit_error_signal: trap handler for INT/TERM (architect §8.1).
+# Emits an action:error audit line with error_code:6, then exits 6.
+#
+# Round-1 Finding 3 fix: when TRAP_ARMED is set, we are inside the post-tag
+# critical section — the tag has been (or may have been) created and the
+# success audit may not yet be on disk. Writing an action:error audit here
+# would CONTRADICT a possibly-pending success audit and violate the
+# one-audit-line-per-outcome invariant. Print CRITICAL to stderr instead and
+# leave manual reconciliation as the documented recovery (manual:118, FAQ).
+#
+# Invoked indirectly via `trap` (see main: `trap 'audit_error_signal; exit ...' INT TERM`).
+# ShellCheck cannot follow this indirect dispatch: SC2317 reports unreachable
+# statements, and ShellCheck 0.11's SC2329 reports the handler as unused.
+# shellcheck disable=SC2317,SC2329
+audit_error_signal() {
+  # Disable further traps to avoid re-entry.
+  trap - INT TERM EXIT
+
+  if (( TRAP_ARMED == 1 )); then
+    printf 'CRITICAL: signal received during tag-write critical section; tag %s may exist without a matching audit line — reconcile .on-loop/release-log.json manually before next release\n' "$TAG" >&2
+    return 0
+  fi
+
+  # Reflect mode in the audit line so reviewers can distinguish bypassed
+  # interruptions from normal ones.
+  local force_str="false" reason_str=""
+  if (( MODE_FORCE == 1 )); then
+    force_str="true"
+    reason_str="$REASON"
+  fi
+
+  # Best-effort: record the interrupt. Ignore failures — we are exiting anyway.
+  if [[ -n "$REPO_ROOT" && -n "$TAG" ]]; then
+    emit_audit "error" "$force_str" "$reason_str" "" "$E_SIGNAL_INT" >/dev/null 2>&1 || true
+  fi
+  printf 'on-loop-tag: interrupted (signal received)\n' >&2
+}
+
+# ==============================================================================
+# Argument parsing (architect §4.1-4.3)
+# ==============================================================================
+
+print_help() {
+  cat <<EOF
+$USAGE_LINE
+
+Creates a signed annotated tag only if all 8 pre-flight checks pass. Audits
+every invocation (success, refusal, force-bypass, error) to
+.on-loop/release-log.json.
+
+Required:
+  <TAG>             Tag name, first positional argument. Must match
+                    ^v[0-9]+\\.[0-9]+\\.[0-9]+(-[a-zA-Z0-9.]+)?$ (e.g. v0.6.2,
+                    v0.7.0-rc1).
+  -m <MESSAGE>      Annotated-tag message (passed through to 'git tag -s -m').
+
+Modes (mutually exclusive):
+  --check           Run the first 7 checks (skips check 8, the interactive
+                    confirmation) and report. Does not create a tag and writes
+                    no audit line. Exit 0 if all 7 pass, else 1.
+  --force           Bypass the prompt and continue past failed checks. Requires
+                    --reason. Failed checks become warnings, not errors.
+  --reason <TEXT>   Free-text justification; required with --force, rejected
+                    without it. Logged immutably to the audit log.
+
+Misc:
+  -h, --help        Print this help and exit 0.
+  -V, --version     Print on-loop-tag <plugin-version> and exit 0.
+
+Exit codes:
+  0 ok / declined cleanly / --check all-pass
+  1 one or more checks failed (non-force mode)
+  2 bad CLI arguments
+  3 not in a git repository (or missing 'git'/'flock' dependency)
+  4 'git tag -s' failed (e.g. GPG agent unavailable)
+  5 'git fetch origin' failed (network error)
+  6 interrupted by SIGINT/SIGTERM
+  7 interactive confirmation needed but stdin is not a TTY
+  8 audit-log lock could not be acquired within 5s
+  9 tag created but audit-log append failed (manual reconciliation needed)
+EOF
+}
+
+parse_args() {
+  if [[ $# -eq 0 ]]; then
+    print_usage
+    exit "$E_USAGE"
+  fi
+
+  local positional_seen=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        print_help
+        exit "$E_OK"
+        ;;
+      -V|--version)
+        # Version is read from plugin.json. We do not require repo context for
+        # --version; fall back to "unknown" if plugin.json is unreachable.
+        local v="unknown"
+        if command -v jq >/dev/null 2>&1; then
+          # Try relative path then absolute (script dir based)
+          local script_dir
+          script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          local candidate="$script_dir/../.claude-plugin/plugin.json"
+          if [[ -f "$candidate" ]]; then
+            v=$(jq -r '.version // "unknown"' "$candidate" 2>/dev/null || echo "unknown")
+          fi
+        fi
+        printf 'on-loop-tag %s\n' "$v"
+        exit "$E_OK"
+        ;;
+      --check)
+        MODE_CHECK=1
+        shift
+        ;;
+      --force)
+        MODE_FORCE=1
+        shift
+        ;;
+      --reason)
+        if [[ $# -lt 2 ]]; then
+          error_usage "--reason requires a value"
+        fi
+        REASON="$2"
+        REASON_SET=1
+        shift 2
+        ;;
+      --reason=*)
+        REASON="${1#--reason=}"
+        REASON_SET=1
+        shift
+        ;;
+      -m)
+        if [[ $# -lt 2 ]]; then
+          error_usage "-m <MESSAGE> is required"
+        fi
+        MESSAGE="$2"
+        MESSAGE_SET=1
+        shift 2
+        ;;
+      -m=*)
+        # Tolerate -m=value form for symmetry, though not strictly in spec.
+        MESSAGE="${1#-m=}"
+        MESSAGE_SET=1
+        shift
+        ;;
+      --)
+        shift
+        # Remaining args treated as positional.
+        while [[ $# -gt 0 ]]; do
+          if (( positional_seen == 0 )); then
+            TAG="$1"
+            positional_seen=1
+          else
+            error_usage "unexpected argument '$1'"
+          fi
+          shift
+        done
+        ;;
+      -*)
+        error_usage "unknown option '$1'"
+        ;;
+      *)
+        if (( positional_seen == 0 )); then
+          TAG="$1"
+          positional_seen=1
+          shift
+        else
+          error_usage "unexpected argument '$1'"
+        fi
+        ;;
+    esac
+  done
+
+  # Validation (architect §4.3)
+  if [[ -z "$TAG" ]]; then
+    error_usage "TAG is required as the first argument"
+  fi
+
+  if (( MODE_CHECK == 1 && MODE_FORCE == 1 )); then
+    error_usage "--check and --force are mutually exclusive"
+  fi
+
+  # --reason only valid with --force
+  if (( REASON_SET == 1 && MODE_FORCE == 0 )); then
+    error_usage "--reason is only valid with --force"
+  fi
+
+  # --force requires --reason
+  if (( MODE_FORCE == 1 && REASON_SET == 0 )); then
+    error_usage '--force requires --reason "<text>"'
+  fi
+
+  # -m required in all modes that may tag. --check still requires -m for
+  # symmetry — the user is rehearsing a tag command. Spec §4.3 lists "Missing
+  # -m" as a usage error unconditionally.
+  if (( MESSAGE_SET == 0 )); then
+    error_usage "-m <MESSAGE> is required"
+  fi
+  if [[ -z "$MESSAGE" ]]; then
+    error_usage "-m message must not be empty"
+  fi
+}
+
+# ==============================================================================
+# Dependency + repo detection
+# ==============================================================================
+
+verify_dependencies() {
+  if ! command -v git >/dev/null 2>&1; then
+    printf 'error: required dependency missing: git\n' >&2
+    exit "$E_NO_REPO"
+  fi
+  if ! command -v flock >/dev/null 2>&1; then
+    printf 'error: required dependency missing: flock (install util-linux)\n' >&2
+    exit "$E_NO_REPO"
+  fi
+}
+
+resolve_repo_root() {
+  local root
+  if ! root=$(git rev-parse --show-toplevel 2>/dev/null); then
+    printf 'error: not a git repository (run from inside a working tree)\n' >&2
+    exit "$E_NO_REPO"
+  fi
+  if [[ -z "$root" ]]; then
+    printf 'error: not a working repository\n' >&2
+    exit "$E_NO_REPO"
+  fi
+  REPO_ROOT="$root"
+}
+
+# ==============================================================================
+# The 8 checks (architect §3)
+#
+# Each check function:
+#   - prints "[PASS] <token> — <detail>" to stdout, OR
+#   - prints "[FAIL] <token> — <detail>" to stdout (summary line)
+#     and the verbose remediation/details to stderr per spec.
+#   - updates CHECKS_PASSED / CHECKS_FAILED arrays.
+#   - returns 0 on PASS, non-zero on FAIL (caller does NOT short-circuit;
+#     architect §4.4 requires running all 8 to give a full report).
+#
+# Special: check_main_synced may exit with code 5 (E_FETCH_FAILED) on network
+# failure — that scenario is NOT recorded as a check pass or fail.
+# ==============================================================================
+
+mark_pass() {
+  local token="$1" detail="$2"
+  CHECKS_PASSED+=("$token")
+  printf '[PASS] %s — %s\n' "$token" "$detail"
+}
+
+# unmark_pass <token>: remove every occurrence of <token> from CHECKS_PASSED.
+# Used by perform_race_recheck (Round-1 Finding 4 fix) when a pre-flight pass
+# is invalidated by the post-prompt re-check — without this, the same token
+# would appear in both checks_passed and checks_failed in the audit line.
+unmark_pass() {
+  local token="$1"
+  local i=0
+  local new_passed=()
+  if (( ${#CHECKS_PASSED[@]} > 0 )); then
+    for i in "${!CHECKS_PASSED[@]}"; do
+      if [[ "${CHECKS_PASSED[$i]}" != "$token" ]]; then
+        new_passed+=("${CHECKS_PASSED[$i]}")
+      fi
+    done
+  fi
+  CHECKS_PASSED=("${new_passed[@]+"${new_passed[@]}"}")
+}
+
+mark_fail() {
+  local token="$1" detail="$2"
+  CHECKS_FAILED+=("$token")
+  printf '[FAIL] %s — %s\n' "$token" "$detail"
+}
+
+# Check 1 — semver_format (architect §3, check 1)
+check_semver_format() {
+  if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+    mark_pass "semver_format" "tag '$TAG' matches vMAJOR.MINOR.PATCH[-PRERELEASE]"
+    return 0
+  fi
+
+  local msg="FAIL semver_format — tag '$TAG' must match vMAJOR.MINOR.PATCH[-PRERELEASE] (example: v0.6.2 or v0.7.0-rc1)"
+  printf '%s\n' "$msg" >&2
+  mark_fail "semver_format" "see stderr"
+  return 1
+}
+
+# Check 2 — tag_not_exists (architect §3, check 2)
+check_tag_not_exists() {
+  local local_exists remote_exists
+  local_exists=$(git -C "$REPO_ROOT" tag -l "$TAG" 2>/dev/null || true)
+  # Remote check; absorb ls-remote network failures silently (we'll catch
+  # general connectivity in check 6 via git fetch).
+  remote_exists=$(git -C "$REPO_ROOT" ls-remote --tags --refs origin "refs/tags/$TAG" 2>/dev/null || true)
+
+  local failed=0
+  if [[ -n "$local_exists" ]]; then
+    printf "FAIL tag_not_exists — tag '%s' already exists locally; delete with 'git tag -d %s' if intentional\n" "$TAG" "$TAG" >&2
+    failed=1
+  fi
+  if [[ -n "$remote_exists" ]]; then
+    printf "FAIL tag_not_exists — tag '%s' already exists on origin; a published tag must never be moved (CVE risk for downstream consumers)\n" "$TAG" >&2
+    failed=1
+  fi
+
+  if (( failed == 1 )); then
+    mark_fail "tag_not_exists" "tag '$TAG' already exists"
+    return 1
+  fi
+  mark_pass "tag_not_exists" "tag '$TAG' is unused locally and on origin"
+  return 0
+}
+
+# Check 3 — on_main (architect §3, check 3)
+check_on_main() {
+  local branch
+  branch=$(git -C "$REPO_ROOT" branch --show-current 2>/dev/null || true)
+
+  if [[ "$branch" == "main" ]]; then
+    mark_pass "on_main" "current branch is main"
+    return 0
+  fi
+
+  if [[ -z "$branch" ]]; then
+    printf "FAIL on_main — HEAD is detached; check out main with 'git checkout main' before tagging\n" >&2
+  else
+    printf "FAIL on_main — currently on branch '%s'; releases tag from main only; run 'git checkout main'\n" "$branch" >&2
+  fi
+  mark_fail "on_main" "not on main"
+  return 1
+}
+
+# Check 4 — clean_tree (architect §3, check 4)
+check_clean_tree() {
+  local porcelain
+  porcelain=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null || true)
+  if [[ -z "$porcelain" ]]; then
+    mark_pass "clean_tree" "working tree is clean"
+    return 0
+  fi
+
+  {
+    printf 'FAIL clean_tree — working tree is dirty:\n'
+    printf '%s\n' "$porcelain" | sed 's/^/  /'
+    printf 'remediation: commit, stash, or discard changes before tagging (this check covers modified, staged, and untracked files)\n'
+  } >&2
+  mark_fail "clean_tree" "see stderr"
+  return 1
+}
+
+# Check 5 — no_session_untracked (architect §3, check 5)
+check_no_session_untracked() {
+  local listing
+  listing=$(git -C "$REPO_ROOT" ls-files --others --exclude-standard .on-loop/sessions/ 2>/dev/null || true)
+  if [[ -z "$listing" ]]; then
+    mark_pass "no_session_untracked" "no untracked on-loop session files"
+    return 0
+  fi
+
+  {
+    printf 'FAIL no_session_untracked — untracked on-loop session files present:\n'
+    printf '%s\n' "$listing" | sed 's/^/  /'
+    printf "remediation: 'rm -rf .on-loop/sessions/<dir>' or commit them; this exact failure caused the v0.2.3 ship incident (2026-05-20) where 'git pull' aborted silently and the wrong commit got tagged\n"
+  } >&2
+  mark_fail "no_session_untracked" "see stderr"
+  return 1
+}
+
+# Check 6 — main_synced (architect §3, check 6; edge case §8.7)
+# On network failure (fetch failed): records main_synced:fetch_failed in
+# CHECKS_SKIPPED, sets FETCH_FAILED=1 so the orchestrator can emit an
+# action:error audit line before exiting "$E_FETCH_FAILED", and returns 1.
+# This honors the invariant that every post-parse outcome produces one
+# audit line (architect §5.5). The remaining checks (7 and, under --force,
+# the tag-creation path) still run so we get a complete report.
+check_main_synced() {
+  if ! git -C "$REPO_ROOT" fetch --quiet origin main 2>/dev/null; then
+    printf "FAIL main_synced — 'git fetch origin main' failed (network or permission issue); ensure you can reach origin\n" >&2
+    # Record as skipped (B1 convention: fetch_failed is a network-error
+    # condition, not a check pass or fail). Caller branches on FETCH_FAILED.
+    CHECKS_SKIPPED+=("main_synced:fetch_failed")
+    FETCH_FAILED=1
+    return 1
+  fi
+
+  local remote_sha local_sha
+  if ! remote_sha=$(git -C "$REPO_ROOT" rev-parse origin/main 2>/dev/null); then
+    # Edge case §8.7 — fetch worked but origin/main is missing.
+    printf "FAIL main_synced — origin/main does not exist; configure remote tracking with 'git branch --set-upstream-to=origin/main main'\n" >&2
+    mark_fail "main_synced" "origin/main missing"
+    return 1
+  fi
+  local_sha=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)
+
+  if [[ -n "$local_sha" && "$local_sha" == "$remote_sha" ]]; then
+    mark_pass "main_synced" "local HEAD == origin/main"
+    return 0
+  fi
+
+  local behind ahead
+  behind=$(git -C "$REPO_ROOT" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+  ahead=$(git -C "$REPO_ROOT" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
+
+  if (( behind > 0 && ahead == 0 )); then
+    printf "FAIL main_synced — local main is %s commits behind origin/main; run 'git pull --ff-only' (and resolve any untracked-file aborts FIRST — see check 5)\n" "$behind" >&2
+  elif (( behind == 0 && ahead > 0 )); then
+    printf "FAIL main_synced — local main is %s commits ahead of origin/main; push first with 'git push origin main' so the release commit is published\n" "$ahead" >&2
+  elif (( behind > 0 && ahead > 0 )); then
+    printf "FAIL main_synced — local main has diverged from origin/main (%s ahead, %s behind); do not tag a divergent branch; reconcile via rebase or merge first\n" "$ahead" "$behind" >&2
+  else
+    # Edge: SHAs differ but rev-list reports 0/0 — should not happen.
+    printf "FAIL main_synced — local HEAD differs from origin/main (state could not be classified); inspect with 'git log --oneline --left-right HEAD...origin/main'\n" >&2
+  fi
+  mark_fail "main_synced" "see stderr"
+  return 1
+}
+
+# Check 7 — signing_key (architect §3, check 7)
+check_signing_key() {
+  local key
+  key=$(git -C "$REPO_ROOT" config --get user.signingkey 2>/dev/null || true)
+  if [[ -n "$key" ]]; then
+    mark_pass "signing_key" "user.signingkey is configured"
+    return 0
+  fi
+
+  printf "FAIL signing_key — git config user.signingkey is empty; configure with 'git config --global user.signingkey <key-id>' (GPG) or 'git config --global user.signingkey ~/.ssh/id_ed25519.pub' + 'git config --global gpg.format ssh' (SSH)\n" >&2
+  mark_fail "signing_key" "see stderr"
+  return 1
+}
+
+# Check 8 — user_confirmed (architect §3, check 8 + §7.3)
+# Returns 0 on yes, 1 on no/EOF.
+# May exit E_NO_TTY if stdin is not a TTY (and we're not in --force).
+#
+# Round-1 Finding 1 fix: the prompt displays the SHA captured immediately
+# after the pre-flight checks (VERIFIED_SHA), not a fresh `git rev-parse HEAD`.
+# If HEAD moved between the checks and the prompt, the operator answers "y"
+# for the SHA that passed verification — and do_tag_and_audit re-verifies
+# HEAD has not moved before signing.
+check_user_confirmed() {
+  local target_sha target_short target_subject
+  target_sha="$VERIFIED_SHA"
+  if [[ -n "$target_sha" ]]; then
+    target_short="${target_sha:0:7}"
+    target_subject=$(git -C "$REPO_ROOT" log -1 --oneline "$target_sha" 2>/dev/null || echo "(unreachable)")
+  else
+    target_short="(unknown)"
+    target_subject="(no commits)"
+  fi
+
+  # TTY policy. The ON_LOOP_TAG_FORCE_TTY_INPUT override is honored ONLY if
+  # BATS sentinel env vars are set (architect §7.3, S-5).
+  local in_bats=0
+  if [[ -n "${BATS_TEST_FILENAME:-}" || -n "${BATS_VERSION:-}" ]]; then
+    in_bats=1
+  fi
+
+  if [[ ! -t 0 ]]; then
+    if (( in_bats == 0 )) || [[ -z "${ON_LOOP_TAG_FORCE_TTY_INPUT:-}" ]]; then
+      printf 'error: interactive confirmation required but stdin is not a TTY; use --force --reason "<text>" to bypass\n' >&2
+      # RETRY-2 fix (Issue 2): every post-argv-parse outcome must produce an
+      # audit line (architect §5.5). Record user_confirmed as skipped with the
+      # :no_tty suffix (same colon-suffix convention used by B1's
+      # main_synced:fetch_failed), then route through emit_audit_or_die so
+      # audit-append failures surface as 8/9.
+      CHECKS_SKIPPED+=("user_confirmed:no_tty")
+      emit_audit_or_die "error" "false" "" "no_tty" "$E_NO_TTY" "$E_NO_TTY"
+    fi
+  fi
+
+  printf 'About to tag %s at %s\n  %s\nProceed? [y/N] ' "$TAG" "$target_short" "$target_subject" >&2
+
+  local reply=""
+  if (( in_bats == 1 )) && [[ -n "${ON_LOOP_TAG_FORCE_TTY_INPUT:-}" ]]; then
+    reply="${ON_LOOP_TAG_FORCE_TTY_INPUT}"
+  else
+    # Read from /dev/tty per architect §3 check 8.
+    read -r reply </dev/tty || reply=""
+  fi
+
+  if [[ "$reply" =~ ^[Yy]$ ]]; then
+    mark_pass "user_confirmed" "operator confirmed at $target_short"
+    return 0
+  fi
+
+  # User declined — clean exit path (caller handles).
+  mark_fail "user_confirmed" "operator declined"
+  return 1
+}
+
+# ==============================================================================
+# Orchestration
+# ==============================================================================
+
+# run_first_seven_checks: run checks 1-7 in order. Always run all 7.
+# Check 6 sets FETCH_FAILED=1 (and records main_synced:fetch_failed in
+# CHECKS_SKIPPED) on network failure rather than exiting — caller emits
+# the audit line and decides whether to honor --force.
+run_first_seven_checks() {
+  check_semver_format         || true
+  check_tag_not_exists        || true
+  check_on_main               || true
+  check_clean_tree            || true
+  check_no_session_untracked  || true
+  check_main_synced           || true
+  check_signing_key           || true
+}
+
+# emit_audit_or_die <action> <force> <reason> <refused_reason> <error_code>
+#                   <fallback_exit_code>
+# Emit a refusal/error audit line. On audit-append failure surface a CRITICAL
+# warning to stderr and exit with the audit-failure code (architect §5.5 last
+# row, B3 retry fix — refusal-path audit failures must override the original
+# exit code). On success, exit with <fallback_exit_code>.
+emit_audit_or_die() {
+  local action="$1" force="$2" reason="$3" refused_reason="$4" error_code="$5"
+  local fallback_exit="$6"
+  local audit_rc=0
+
+  emit_audit "$action" "$force" "$reason" "$refused_reason" "$error_code" \
+    || audit_rc=$?
+
+  if (( audit_rc == 0 )); then
+    exit "$fallback_exit"
+  fi
+
+  printf 'CRITICAL: failed to write audit line for %s outcome — manual reconciliation needed (audit_rc=%s)\n' \
+    "$action" "$audit_rc" >&2
+  if (( audit_rc == E_LOCK_TIMEOUT )); then
+    exit "$E_LOCK_TIMEOUT"
+  fi
+  exit "$E_AUDIT_FAILED"
+}
+
+# perform_race_recheck: re-run check 2 (tag_not_exists) immediately before
+# `git tag -s` to close the TOCTOU window between pre-flight and signing
+# (architect §8.6, B2 retry fix). A concurrent push from another shell can
+# land between check 2 and the prompt; this guarantees we never overwrite a
+# published tag even under --force (race is a correctness issue, not a
+# bypass-able policy).
+perform_race_recheck() {
+  # RETRY-2 fix (Issue 1): the prior `|| true` swallowed `ls-remote` network
+  # failures and treated them as "tag absent", undermining the race check.
+  # Capture stderr + exit code explicitly; on non-zero, refuse with
+  # race_recheck_failed and exit E_FETCH_FAILED. This applies in BOTH normal
+  # and --force modes (correctness, not a bypass-able policy — same as the
+  # actual race detection).
+  local local_exists local_rc=0
+  local remote_exists remote_rc=0
+  local local_err remote_err
+  local force_str="false" reason_str=""
+  if (( MODE_FORCE == 1 )); then
+    force_str="true"
+    reason_str="$REASON"
+  fi
+
+  # Local tag -l (extremely unlikely to fail, but check for consistency).
+  # Single invocation: capture stdout AND merge stderr to a temp; rc gates the
+  # error branch. No `|| true` — failures must not be silently swallowed.
+  local local_stderr_file remote_stderr_file
+  local_stderr_file=$(mktemp)
+  local_exists=$(git -C "$REPO_ROOT" tag -l "$TAG" 2>"$local_stderr_file") || local_rc=$?
+  if (( local_rc != 0 )); then
+    local_err=$(cat "$local_stderr_file" 2>/dev/null || true)
+    rm -f "$local_stderr_file"
+    printf 'ERROR: cannot verify remote tag absence before signing (ls-remote failed); aborting to prevent unverified tag creation\n' >&2
+    printf '  (local git tag -l failed: %s)\n' "$local_err" >&2
+    # Round-1 Finding 4 fix: tag_not_exists was marked passed during pre-flight
+    # check 2 — invalidate that pass before recording the refusal so the audit
+    # line is internally consistent.
+    unmark_pass "tag_not_exists"
+    CHECKS_FAILED=("tag_not_exists")
+    emit_audit_or_die "refused" "$force_str" "$reason_str" "race_recheck_failed" "" "$E_FETCH_FAILED"
+  fi
+  rm -f "$local_stderr_file"
+
+  # Remote ls-remote — primary failure surface (network, auth, DNS, etc.).
+  remote_stderr_file=$(mktemp)
+  remote_exists=$(git -C "$REPO_ROOT" ls-remote --tags --refs origin "refs/tags/$TAG" 2>"$remote_stderr_file") || remote_rc=$?
+  if (( remote_rc != 0 )); then
+    remote_err=$(cat "$remote_stderr_file" 2>/dev/null || true)
+    rm -f "$remote_stderr_file"
+    printf 'ERROR: cannot verify remote tag absence before signing (ls-remote failed); aborting to prevent unverified tag creation\n' >&2
+    printf '  (git ls-remote failed: %s)\n' "$remote_err" >&2
+    # Round-1 Finding 4 fix: see comment in local-failure branch above.
+    unmark_pass "tag_not_exists"
+    CHECKS_FAILED=("tag_not_exists")
+    emit_audit_or_die "refused" "$force_str" "$reason_str" "race_recheck_failed" "" "$E_FETCH_FAILED"
+  fi
+  rm -f "$remote_stderr_file"
+
+  if [[ -n "$local_exists" || -n "$remote_exists" ]]; then
+    printf "ERROR: tag '%s' was created concurrently between pre-flight check and tag invocation; aborting\n" "$TAG" >&2
+    # Reset accounting so the audit line clearly attributes the refusal to
+    # the race, regardless of the prior tag_not_exists pass.
+    # Round-1 Finding 4 fix: also strip the now-invalid pass from CHECKS_PASSED.
+    unmark_pass "tag_not_exists"
+    CHECKS_FAILED=("tag_not_exists")
+    emit_audit_or_die "refused" "$force_str" "$reason_str" "race_detected" "" "$E_CHECK_FAIL"
+  fi
+}
+
+# ==============================================================================
+# Main
+# ==============================================================================
+
+main() {
+  # Install signal trap BEFORE the long-running portion (architect §8.1).
+  # We need REPO_ROOT and TAG populated for a useful audit line, but a trap
+  # installed earlier still exits with code 6 — it just may write a partial
+  # audit. We arm it after argv parse + repo resolution.
+  parse_args "$@"
+  verify_dependencies
+  resolve_repo_root
+
+  SCRIPT_VERSION=$(read_script_version)
+
+  # Now safe to audit signals.
+  trap 'audit_error_signal; exit '"$E_SIGNAL_INT" INT TERM
+
+  # ---------------------------------------------------------------------------
+  # CHECK MODE (architect §4.4 row 5+6, §5.5 row 4)
+  # ---------------------------------------------------------------------------
+  if (( MODE_CHECK == 1 )); then
+    run_first_seven_checks
+    # Architect §7.6 test 12: --check does not run the interactive prompt,
+    # and writes no audit line. We still run all checks 1-7 above (no prompt).
+    # A fetch failure surfaces as exit 5 with no audit line (consistent with
+    # --check's "no audit" semantics).
+    if (( FETCH_FAILED == 1 )); then
+      exit "$E_FETCH_FAILED"
+    fi
+    if (( ${#CHECKS_FAILED[@]} > 0 )); then
+      exit "$E_CHECK_FAIL"
+    fi
+    exit "$E_OK"
+  fi
+
+  # ---------------------------------------------------------------------------
+  # FORCE MODE (architect §4.4 last two rows, §5.5 rows 5,6, ADR-007)
+  # ---------------------------------------------------------------------------
+  if (( MODE_FORCE == 1 )); then
+    run_first_seven_checks
+    # FAILs are warnings — print to stderr (already printed during checks).
+    if (( ${#CHECKS_FAILED[@]} > 0 )); then
+      printf 'WARNING: --force is bypassing %s failed check(s): %s\n' \
+        "${#CHECKS_FAILED[@]}" "${CHECKS_FAILED[*]}" >&2
+    fi
+    if (( FETCH_FAILED == 1 )); then
+      printf 'WARNING: --force is bypassing fetch failure (main_synced:fetch_failed); proceeding because --reason was supplied\n' >&2
+    fi
+    # Skip user_confirmed (architect §3 check 8 note: auto-pass under --force,
+    # recorded in checks_skipped, NOT in checks_passed).
+    CHECKS_SKIPPED+=("user_confirmed")
+
+    # Round-1 Finding 1 fix: pin to the SHA observed at end of pre-flight.
+    # --force authorizes bypassing CHECK FAILURES, not "tag a different commit
+    # than the one I just inspected" — HEAD-movement re-verification still
+    # applies (correctness, not bypass-able; same as the race recheck).
+    VERIFIED_SHA=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)
+    if [[ -z "$VERIFIED_SHA" ]]; then
+      printf '\nError: could not read HEAD after pre-flight checks\n' >&2
+      emit_audit_or_die "error" "true" "$REASON" "" "$E_NO_REPO" "$E_NO_REPO"
+    fi
+
+    do_tag_and_audit "true" "$REASON"
+    # do_tag_and_audit always exits; the return is a defensive guard against a
+    # future refactor that might change that contract.
+    # shellcheck disable=SC2317
+    return
+  fi
+
+  # ---------------------------------------------------------------------------
+  # NORMAL MODE
+  # ---------------------------------------------------------------------------
+  run_first_seven_checks
+
+  # Fetch failure (architect §5.5: every invocation must produce one audit
+  # line; B1 retry fix). In normal mode, action:error with error_code:5.
+  if (( FETCH_FAILED == 1 )); then
+    printf '\nError: could not fetch from origin; aborting (no tag created)\n' >&2
+    emit_audit_or_die "error" "false" "" "" "$E_FETCH_FAILED" "$E_FETCH_FAILED"
+  fi
+
+  if (( ${#CHECKS_FAILED[@]} > 0 )); then
+    # Refused: checks_failed (architect §4.4 row 3, §5.5 row 2)
+    printf '\nRefused: %s check(s) failed: %s\n' \
+      "${#CHECKS_FAILED[@]}" "${CHECKS_FAILED[*]}" >&2
+    emit_audit_or_die "refused" "false" "" "checks_failed" "" "$E_CHECK_FAIL"
+  fi
+
+  # Round-1 Finding 1 fix: capture the verified HEAD SHA now that all seven
+  # checks have passed. The prompt shows this SHA, and do_tag_and_audit
+  # re-verifies HEAD has not moved before signing — so the operator's "y"
+  # binds to the inspected commit, not "whatever HEAD is at signing time."
+  VERIFIED_SHA=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)
+  if [[ -z "$VERIFIED_SHA" ]]; then
+    printf '\nError: could not read HEAD after pre-flight checks\n' >&2
+    emit_audit_or_die "error" "false" "" "" "$E_NO_REPO" "$E_NO_REPO"
+  fi
+
+  # All 7 checks passed; run the interactive prompt (check 8).
+  if check_user_confirmed; then
+    # User said yes.
+    do_tag_and_audit "false" ""
+    # Same defensive-return rationale as the --force branch above.
+    # shellcheck disable=SC2317
+    return
+  else
+    # User declined — clean exit 0 (architect §3 check 8, §4.4 row 2).
+    # user_confirmed was added to CHECKS_FAILED; the audit log records this
+    # with action:refused, refused_reason:user_declined and an EMPTY
+    # checks_failed (architect §5.3 example 2).
+    CHECKS_FAILED=()
+    printf 'Aborted by user — no tag created\n' >&2
+    emit_audit_or_die "refused" "false" "" "user_declined" "" "$E_OK"
+  fi
+}
+
+# do_tag_and_audit <force_bool_str> <reason>
+# Runs `git tag -s` and writes the audit log line. Manages the trap window
+# per architect §8.2 with Round-1 Finding 3 hardening (TRAP_ARMED critical
+# section so signals received between tag creation and audit append do not
+# emit a contradictory action:error audit line).
+do_tag_and_audit() {
+  local force_str="$1" reason="$2"
+
+  # Round-1 Finding 1 fix: refuse if HEAD has moved since VERIFIED_SHA was
+  # captured. This is a correctness check (not bypass-able by --force) — the
+  # operator authorized tagging a specific commit, and we will not silently
+  # tag a different one.
+  local current_head
+  current_head=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)
+  if [[ -z "$VERIFIED_SHA" || -z "$current_head" || "$current_head" != "$VERIFIED_SHA" ]]; then
+    printf "ERROR: HEAD moved between pre-flight checks and tag creation (verified=%s, current=%s); refusing to tag\n" \
+      "${VERIFIED_SHA:-(unset)}" "${current_head:-(unset)}" >&2
+    CHECKS_FAILED=("head_moved")
+    emit_audit_or_die "refused" "$force_str" "$reason" "head_moved" "" "$E_CHECK_FAIL"
+  fi
+
+  # Architect §8.2: disable INT/TERM trap immediately before the audit append,
+  # but we want it ARMED through git tag -s so that signals during signing
+  # still produce an error audit. So: run git tag -s with trap ARMED, then
+  # disable the trap before audit_append.
+  #
+  # We invoke `git` in the repo root (via `cd` in a subshell scope here)
+  # rather than `git -C`, because the bats test shim in architect §7.2 keys
+  # on $1==tag && $2==-s and would not match a `-C <path>` prefix.
+  local tag_rc=0
+  # Temporarily relax errexit so we can capture the real exit status.
+  set +e
+  # B2 retry fix: re-verify tag_not_exists immediately before `git tag -s`
+  # to close the TOCTOU window between the pre-flight check and the signing
+  # call. perform_race_recheck emits a refusal audit and exits on collision.
+  perform_race_recheck
+  # Round-1 Finding 3 fix: enter the post-tag critical section. From this
+  # point until the audit append completes, the INT/TERM handler must NOT
+  # emit a contradictory "action:error" audit (audit_error_signal checks
+  # TRAP_ARMED and prints CRITICAL to stderr instead).
+  #
+  # Round-1 Finding 1 fix: pass VERIFIED_SHA explicitly to `git tag -s` so
+  # the tag is pinned to the SHA that passed pre-flight, not to "whatever
+  # HEAD is at signing time."
+  TRAP_ARMED=1
+  ( cd "$REPO_ROOT" && git tag -s "$TAG" "$VERIFIED_SHA" -m "$MESSAGE" )
+  tag_rc=$?
+  set -e
+  if (( tag_rc != 0 )); then
+    # git tag -s failed (architect §2.3 exit 4, §5.5 row 7). Audit-append
+    # failures on this path must also surface (B3 retry fix). No tag was
+    # created, so leaving the critical section before the error audit is
+    # safe — audit_error_signal can write a normal action:error line.
+    TRAP_ARMED=0
+    printf "error: 'git tag -s %s' failed (exit %s); inspect GPG agent / signing key configuration\n" "$TAG" "$tag_rc" >&2
+    emit_audit_or_die "error" "$force_str" "$reason" "" "$E_GIT_TAG_FAILED" "$E_GIT_TAG_FAILED"
+  fi
+
+  # Tag created. Resolve the tag's canonical commit-target for the audit
+  # line (Round-1 Finding 2 fix — the audit `commit` field names the SHA
+  # the tag actually points at, even if HEAD moves between now and audit
+  # append). Fall back to VERIFIED_SHA if resolution fails (cannot happen
+  # in practice — the tag we just signed must resolve — but defensive).
+  local tag_commit
+  tag_commit=$(git -C "$REPO_ROOT" rev-parse "$TAG^{commit}" 2>/dev/null || true)
+  if [[ -z "$tag_commit" ]]; then
+    tag_commit="$VERIFIED_SHA"
+  fi
+
+  # Round-1 Finding 3 fix: keep the INT/TERM trap ARMED through the audit
+  # append. `audit_error_signal` recognises TRAP_ARMED=1 and refuses to emit
+  # a contradictory action:error audit while a tagged outcome is mid-write —
+  # it prints CRITICAL to stderr instead and the shell exits 6, leaving the
+  # documented manual-reconciliation path (manual:FAQ post-tag interrupt).
+  local audit_rc=0
+  emit_audit "tagged" "$force_str" "$reason" "" "" "$tag_commit" || audit_rc=$?
+
+  # Audit append complete. Leave the critical section, then disarm the
+  # signal trap so subsequent signals follow bash defaults.
+  TRAP_ARMED=0
+  trap - INT TERM
+
+  case "$audit_rc" in
+    0)
+      printf '\nCreated %s. Next: git push origin %s\n' "$TAG" "$TAG"
+      exit "$E_OK"
+      ;;
+    "$E_LOCK_TIMEOUT")
+      # CRITICAL — tag exists but no audit line. Do NOT delete the tag
+      # (architect §5.5 last row, Recommendations for Next Agent §4).
+      printf 'CRITICAL: tag %s was created but audit-log lock could not be acquired; reconcile .on-loop/release-log.json manually\n' "$TAG" >&2
+      exit "$E_LOCK_TIMEOUT"
+      ;;
+    *)
+      printf 'CRITICAL: tag %s was created but audit-log append failed; reconcile .on-loop/release-log.json manually (do NOT delete the tag)\n' "$TAG" >&2
+      exit "$E_AUDIT_FAILED"
+      ;;
+  esac
+}
+
+main "$@"

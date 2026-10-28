@@ -191,6 +191,9 @@ cython_debug/
 # Claude Code worktrees
 .claude/worktrees/
 
+# on-loop-tag audit-log lock file (runtime-only artifact)
+.on-loop/release-log.json.lock
+
 # Ruff stuff:
 .ruff_cache/
 

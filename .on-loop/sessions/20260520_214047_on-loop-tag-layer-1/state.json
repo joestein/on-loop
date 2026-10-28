@@ -1,0 +1,16 @@
+{
+  "version": "1.1",
+  "session_id": "e073386a-e8a8-4340-8f57-453a720b3051",
+  "session_name": "20260520_214047_on-loop-tag-layer-1",
+  "phase": "GIT",
+  "prompt": "Ship Layer 1 of the conservative release-tagging pipeline (bin/on-loop-tag) as a new feature in UlyssesModel/on-loop. Single PR scope. Motivated by 2026-05-20 v0.2.3 ship-sequence incident where untracked .on-loop/sessions/ files silently aborted git pull and caused tagging of the wrong commit.",
+  "branch": "on-loop/on-loop-tag-layer-1",
+  "worktree_path": ".claude/worktrees/on-loop-tag-layer-1",
+  "session_dir": ".on-loop/sessions/20260520_214047_on-loop-tag-layer-1",
+  "created_at": "2026-05-20T21:40:47Z",
+  "retries": {
+    "test": 0,
+    "security": 0,
+    "review": 2
+  }
+}

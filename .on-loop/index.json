@@ -26,6 +26,19 @@
       "worktree_path": ".claude/worktrees/on-loop-debug-fix",
       "session_dir": ".on-loop/sessions/20260426_100540_on-loop-debug-fix",
       "pr_url": null
+    },
+    {
+      "session_id": "e073386a-e8a8-4340-8f57-453a720b3051",
+      "session_name": "20260520_214047_on-loop-tag-layer-1",
+      "loop_id": "e073386a-e8a8-4340-8f57-453a720b3051",
+      "prompt": "Ship Layer 1 of the conservative release-tagging pipeline (bin/on-loop-tag) as a new feature in UlyssesModel/on-loop.",
+      "branch": "on-loop/on-loop-tag-layer-1",
+      "status": "active",
+      "started_at": "2026-05-20T21:40:47Z",
+      "completed_at": null,
+      "worktree_path": ".claude/worktrees/on-loop-tag-layer-1",
+      "session_dir": ".on-loop/sessions/20260520_214047_on-loop-tag-layer-1",
+      "pr_url": null
     }
   ]
 }
